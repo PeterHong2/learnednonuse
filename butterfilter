@@ -1,0 +1,193 @@
+function EEG=butterfilt(EEG,flt,baseline,n_pad)
+
+ 
+if nargin<2,
+    error('butterfilt.m requires at least two inputs.');
+end
+if nargin<3,
+    baseline=[];
+end
+if nargin<4 || isempty(n_pad),
+    n_pad=2*EEG.pnts;
+end
+ 
+if length(flt)~=2,
+    error('''filt'' parameter argument should be a two element vector.');
+elseif max(flt)>(EEG.srate/2),
+    error('''filt'' parameters need to be less than or equal to (sampling rate)/2 (i.e., %f).',EEG.srate/2);
+elseif (flt(2)==(EEG.srate/2)) && (flt(1)==0),
+    error('If second element of ''filt'' parameter is EEG.srate/2, then the first element must be greater than 0.');
+elseif abs(flt(2))<=abs(flt(1)),
+    error('Second element of ''filt'' parameters must be greater than first in absolute value.');
+elseif (flt(1)<0) || (flt(2)<0),
+    if (flt(1)>=0) || (flt(2)>=0),
+        error('BOTH parameters of ''filt'' need to be greater than or equal to zero OR need to be negative.');
+    end
+    if min(flt)<=(-EEG.srate/2),
+        error('''filt'' parameters need to be greater than sampling rate/2 (i.e., -%f) when creating a stop band.',EEG.srate/2);
+    end
+end
+
+fprintf('\nFiltering data with 3rd order Butterworth filter: ');
+if (flt(1)==0),
+    %lowpass filter the data
+    [B A]=butter(3,flt(2)*2/EEG.srate,'low');
+    fprintf('lowpass at %.2f Hz\n',flt(2));
+elseif (flt(2)==(EEG.srate/2)),
+    %highpass filter the data
+    [B A]=butter(3,flt(1)*2/EEG.srate,'high');
+    fprintf('highpass at %.2f Hz\n',flt(1));
+elseif (flt(1)<0)
+    %bandstop filter the data
+    flt=-flt;
+    [B A]=butter(3,flt*2/EEG.srate,'stop');
+    fprintf('stopband from %.2f to %.2f Hz\n',flt(1),flt(2));
+else
+    %bandpass filter the data
+    [B A]=butter(3,flt*2/EEG.srate);
+    fprintf('bandpass from %.2f to %.2f Hz\n',flt(1),flt(2));
+end
+%preallocate memory
+total_pad=n_pad*2;
+total_tpts=total_pad+EEG.pnts;
+padded=zeros(1,total_tpts);
+ 
+ 
+fprintf('Adding %d time points of zeros before and after each epoch of data.\n',n_pad);
+fprintf('Padded values are linear interpolations between the first and last value of each epoch of data.\n');
+s=size(EEG.data);
+if n_pad,
+    for chan=1:s(1),
+        fprintf('Now filtering channel: %s\n',EEG.chanlocs(chan).labels);
+        for trial=1:s(3),
+            padded(n_pad+1:n_pad+EEG.pnts)=squeeze(EEG.data(chan,:,trial)); %put real data in the middle
+            inc=(EEG.data(chan,EEG.pnts,trial)-EEG.data(chan,1,trial))/(total_pad+1);
+            %add padding before the real data
+            for a=n_pad:-1:1,
+                padded(a)=padded(a+1)+inc;
+            end
+            %add padding after the real data
+            for a=n_pad+EEG.pnts+1:total_tpts,
+                padded(a)=padded(a-1)-inc;
+            end
+            %Note, those for loops are actually faster than using the
+            %MATLAB linspace function.  Go figure.
+            filtered=filtfilt(B,A,padded);
+            EEG.data(chan,:,trial)=filtered(n_pad+1:n_pad+EEG.pnts);
+        end
+    end
+else
+    %no padding
+    for chan=1:s(1),
+        for trial=1:s(3),
+            EEG.data(chan,:,trial)=filtfilt(B,A,squeeze(EEG.data(chan,:,trial)));
+      end
+    end
+end
+
+%Find out if EEG variable has independent components
+if ~isempty(EEG.icawinv) && ~isempty(EEG.icasphere),
+    ics_present=1;
+else
+    ics_present=0;
+end
+
+
+%% Mean Baseline Each Trial (if requested) %%
+if ~isempty(baseline),
+    %check argument values for errors
+    if baseline(2)<baseline(1),
+        error('First element of ''baseline'' argument needs to be less than or equal to second argument.');
+    elseif baseline(2)<EEG.times(1),
+        error('Second element of ''baseline'' argument needs to be greater than or equal to epoch start time %.1f.',EEG.times(1));
+    elseif baseline(1)>EEG.times(end),
+        error('First element of ''baseline'' argument needs to be less than or equal to epoch end time %.1f.',EEG.times(end));
+    end
+    
+    %convert msec into time points
+    if baseline(1)<EEG.times(1),
+        strt_pt=1;
+    else
+        strt_pt=find_crspnd_pt(baseline(1),EEG.times,1:length(EEG.times));
+        strt_pt=ceil(strt_pt);
+    end
+    if baseline(end)>EEG.times(end),
+        end_pt=length(EEG.times);
+    else
+        end_pt=find_crspnd_pt(baseline(2),EEG.times,1:length(EEG.times));
+        end_pt=floor(end_pt);
+    end
+    fprintf('\nRemoving pre-stimulus mean baseline from %.1f to %.1f msec.\n\n',EEG.times(strt_pt),EEG.times(end_pt));
+    EEG.data=rmbase(EEG.data,s(2),strt_pt:end_pt);
+    if ics_present,
+        %re-compute ICA activations
+        EEG.icaact=EEG.icaweights*EEG.icasphere*EEG.data;
+        EEG.icaact=reshape(EEG.icaact,s(1),s(2),s(3));
+    end
+    EEG.data=reshape(EEG.data,s(1),s(2),s(3));
+else
+    if ics_present,
+        %re-compute ICA activations
+        EEG.icaact=EEG.icaweights*EEG.icasphere*reshape(EEG.data,s(1),s(2)*s(3));
+        disp(size(EEG.icaact));
+        disp(s(1));
+        disp(s(2));
+        disp(s(3));
+
+        EEG.icaact=reshape(EEG.icaact,17,s(2),s(3));
+    end
+
+end
+EEG.saved='no';
+ 
+% if ~isempty(EEG.icawinv),
+%     % normalize ICs to unit topography length and recompute IC features
+%     EEG=cmpt_ic_art_ftrs(EEG);
+% end
+ 
+fprintf('EEG has been filtered.  You must save the EEG variable to preserve changes.\n'); 
+if ischar(EEG.history),
+    %if EEG.history is a string, turn it into a cell array
+    temp=EEG.history;
+    EEG.history=[];
+    EEG.history{1}=temp;
+end
+if isempty(baseline),
+    EEG.history{length(EEG.history)+1}=sprintf('EEG=butterfilt(EEG,[%f %f],[],%d);',flt(1),flt(2),n_pad);
+else
+    EEG.history{length(EEG.history)+1}=sprintf('EEG=butterfilt(EEG,[%f %f],[%d %d],%d);',flt(1),flt(2),baseline(1),baseline(2),n_pad);
+end
+ 
+function y_pt=find_crspnd_pt(targ,vals,outtrials)
+
+%find closest point above
+abv=find(vals>=targ);
+if isempty(abv),
+    %point lies outside of vals range, can't interpolate
+    y_pt=[];
+    return
+end
+abv=abv(1);
+
+%find closest point below
+blw=find(vals<=targ);
+if isempty(blw),
+    %point lies outside of vals range, can't interpolate
+    y_pt=[];
+    return
+end
+blw=blw(end);
+
+if (vals(abv)==vals(blw)),
+    %exact match
+    ids=find(vals==targ);
+    y_pt=median(outtrials(ids));
+else
+    %interpolate point
+    
+    %lst squares inear regression
+    B=regress([outtrials(abv) outtrials(blw)]',[ones(2,1) [vals(abv) vals(blw)]']);
+    
+    %predict outtrial point from target value
+    y_pt=[1 targ]*B;   
+end
